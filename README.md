@@ -10,65 +10,43 @@ A Flask web application that provides a user interface for the browser-use agent
 
 ## Installation
 
-1. Clone the repository or download the source code
-2. Create a virtual environment:
-   ```
-   python -m venv venv
-   ```
-3. Activate the virtual environment:
-   - Windows: `venv\Scripts\activate`
-   - macOS/Linux: `source venv/bin/activate`
-4. Install the required packages:
-   ```
-   pip install -r requirements.txt
-   ```
-5. Install Playwright browsers (required for browser-use):
-   ```
-   playwright install chromium
-   ```
+1. Clone the repository:
+```bash
+git clone <repository-url>
+cd jobsagent2
+```
 
-## Configuration
+2. Create and activate a virtual environment:
+```bash
+python -m venv .venv
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+```
 
-1. Create a `.env` file in the project root directory
-2. Add your API keys:
-   ```
-   OPENAI_API_KEY=your_openai_api_key
-   OPENAI_MODEL=gpt-4o
-   TIMEOUT=300
-   DEBUG=False
-   ```
+3. Install dependencies:
+```bash
+pip install -r requirements.txt
+```
 
-Alternatively, you can configure these settings through the Settings page in the application.
+4. Configure environment variables:
+- Create a `.env` file in the project root
+- Set required API keys and configuration (see GETTING_STARTED.md)
 
-## Running the Application
+## Usage
 
-1. Activate your virtual environment (if not already activated)
-2. Run the Flask application:
-   ```
-   python app.py
-   ```
-3. Open your web browser and navigate to:
-   ```
-   http://127.0.0.1:5000/
-   ```
+1. Start the application:
+```bash
+python app.py
+```
 
-## Features
+2. Access the web interface at `http://localhost:5000`
 
-### Home Page
-- Submit browser automation tasks with natural language prompts
-- View real-time logs as the agent executes the task
-- Cancel running tasks
-- See the final result and download it as a Word document
+3. Configure your settings in the Settings page
 
-### Results Page
-- Browse all past results
-- Download result documents
-- Delete unwanted results
+4. Enter your research prompt and optional format instructions
 
-### Settings Page
-- Configure API keys
-- Set OpenAI model selection
-- Adjust task timeout settings
+5. Start the task and monitor progress
+
+6. Download or manage results from the Results page
 
 ## Project Structure
 
