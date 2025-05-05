@@ -1,31 +1,85 @@
 {% extends "base.html" %}
 
-{% block title %}AOTT AI Research Agent - Run Task{% endblock %}
+{% block title %}AOTT AI Research Agent - Search{% endblock %}
 
 {% block content %}
 <div class="row">
     <div class="col-lg-12">
         <div class="card mb-4">
             <div class="card-header">
-                <h2><i class="fas fa-play-circle me-2"></i>Run Browser Task</h2>
+                <h2><i class="fas fa-search me-2"></i>Search Prompt</h2>
             </div>
             <div class="card-body">
+                <h1 class="mb-4">Jobs Agent</h1>
+                
+                <!-- Agent Selection Toggle -->
+                <div class="mb-3 agent-toggle-container d-flex align-items-center">
+                    <label class="form-label me-2 mb-0">Agent Type:</label>
+                    <label class="form-check-label me-2" for="agent-type-toggle">Browser Agent</label>
+                    <div class="form-check form-switch form-check-inline me-2 mb-0">
+                        <input class="form-check-input" type="checkbox" role="switch" id="agent-type-toggle" style="cursor: pointer;">
+                    </div>
+                    <label class="form-check-label" for="agent-type-toggle">Tavily Agent</label>
+                </div>
+
                 <form id="taskForm">
+                    <!-- Model & Step Settings Row -->
+                    <div class="row mb-3">
+                        <div class="col-md-6">
+                            <label for="modelSelect" class="form-label">
+                                <i class="fas fa-robot me-1"></i> Model:
+                            </label>
+                            <select class="form-select" id="modelSelect" name="modelSelect">
+                                <!-- These will be populated dynamically with available models -->
+                                <option value="" disabled>Loading models...</option>
+                            </select>
+                            <div class="form-text">Select the AI model to use for this search</div>
+                        </div>
+                        <div class="col-md-6">
+                            <label for="outputFormatSelect" class="form-label">
+                                <i class="fas fa-file-export me-1"></i> Output Format:
+                            </label>
+                            <select class="form-select" id="outputFormatSelect" name="outputFormatSelect">
+                                <option value="docx" selected>Word Document (.docx)</option>
+                                <option value="xlsx">Spreadsheet (.xlsx)</option>
+                            </select>
+                            <div class="form-text">Choose the format for the output file</div>
+                        </div>
+                    </div>
+                    <div class="row mb-3">
+                        <div class="col-md-6">
+                            <label for="maxSteps" class="form-label">
+                                <i class="fas fa-shoe-prints me-1"></i> Maximum Steps:
+                            </label>
+                            <input type="number" class="form-control" id="maxSteps" name="maxSteps" min="5" max="100" value="30">
+                            <div class="form-text">Limits how many browser actions the agent will perform overall</div>
+                        </div>
+                        <div class="col-md-6">
+                            <div class="form-check mt-4 pt-2">
+                                <input class="form-check-input" type="checkbox" id="runHeadlessCheckbox" name="runHeadlessCheckbox">
+                                <label class="form-check-label" for="runHeadlessCheckbox">
+                                    Run Headless (no visible browser window)
+                                </label>
+                                <div class="form-text">Check this to run the browser in the background.</div>
+                            </div>
+                        </div>
+                    </div>
+                    
                     <div class="mb-3">
-                        <label for="promptInput" class="form-label">Enter your task instructions:</label>
+                        <label for="promptInput" class="form-label">Enter your search instructions:</label>
                         <textarea class="form-control" id="promptInput" rows="4" placeholder="e.g., Go to example.com and search for 'climate change news'"></textarea>
                     </div>
                     
                     <div class="mb-3">
                         <label for="formatPrompt" class="form-label">
-                            <i class="fas fa-file-alt me-1"></i> Output Document Format (optional):
+                            <i class="fas fa-file-alt me-1"></i> Output Document Format Prompt (optional):
                         </label>
                         <textarea class="form-control" id="formatPrompt" rows="3" placeholder="e.g., Format the output as a business report with executive summary, findings, and recommendations"></textarea>
                         <div class="form-text">Specify how you want the results to be formatted in the output document</div>
                     </div>
                     
                     <button type="submit" class="btn btn-primary" id="runButton">
-                        <i class="fas fa-play me-2"></i>Run Task
+                        <i class="fas fa-search me-2"></i>Start Search
                     </button>
                 </form>
             </div>
@@ -87,6 +141,7 @@
         </div>
     </div>
 </div>
+
 {% endblock %}
 
 {% block scripts %}
@@ -97,6 +152,93 @@
     let logUpdateInterval = null;
     let taskRunning = false;
     let socket = null;
+    
+    // Load available models when page loads
+    window.addEventListener('load', function() {
+        loadAvailableModels();
+        checkForRunningTasks();
+    });
+    
+    // Function to load available models
+    function loadAvailableModels() {
+        const modelSelect = document.getElementById('modelSelect');
+        modelSelect.innerHTML = '<option value="" disabled selected>Loading models...</option>';
+        
+        fetch('/available_models')
+            .then(response => {
+                if (!response.ok) {
+                    throw new Error(`HTTP error! Status: ${response.status}`);
+                }
+                return response.json();
+            })
+            .then(data => {
+                modelSelect.innerHTML = ''; // Clear loading option
+                
+                if (data.error) {
+                    console.error('Server reported error:', data.error);
+                    // We'll still try to use the data if available
+                }
+                
+                if (data.current_model) {
+                    // Add current model as first option and select it
+                    const currentOption = document.createElement('option');
+                    currentOption.value = data.current_model.id;
+                    currentOption.textContent = `${data.current_model.name} (Current)`;
+                    currentOption.selected = true;
+                    modelSelect.appendChild(currentOption);
+                }
+                
+                // Add all available models
+                if (data.available_models && data.available_models.length > 0) {
+                    data.available_models.forEach(model => {
+                        // Skip if this is the current model (already added)
+                        if (data.current_model && model.id === data.current_model.id) {
+                            return;
+                        }
+                        
+                        const option = document.createElement('option');
+                        option.value = model.id;
+                        option.textContent = model.name;
+                        modelSelect.appendChild(option);
+                    });
+                } else {
+                    // If no models available, show a default option
+                    const defaultOption = document.createElement('option');
+                    defaultOption.value = "";
+                    defaultOption.textContent = "No models available";
+                    defaultOption.disabled = true;
+                    modelSelect.appendChild(defaultOption);
+                }
+            })
+            .catch(error => {
+                console.error('Error loading models:', error);
+                
+                // Clear previous options
+                modelSelect.innerHTML = '';
+                
+                // Add default models
+                const defaultModels = [
+                    { id: "gpt-4o", name: "GPT-4o (Default)" },
+                    { id: "claude-3-sonnet-20240229", name: "Claude 3 Sonnet (Default)" },
+                    { id: "llama3", name: "Llama 3 (Default)" }
+                ];
+                
+                // Add a current model option
+                const currentOption = document.createElement('option');
+                currentOption.value = defaultModels[0].id;
+                currentOption.textContent = `${defaultModels[0].name}`;
+                currentOption.selected = true;
+                modelSelect.appendChild(currentOption);
+                
+                // Add the rest of the default models
+                for (let i = 1; i < defaultModels.length; i++) {
+                    const option = document.createElement('option');
+                    option.value = defaultModels[i].id;
+                    option.textContent = defaultModels[i].name;
+                    modelSelect.appendChild(option);
+                }
+            });
+    }
 
     // Initialize Socket.IO
     function initializeSocket() {
@@ -123,10 +265,10 @@
             reconnectionAttempts: 5,
             reconnectionDelay: 1000
         });
-        
-        // Handle socket events
-        socket.on('connect', function() {
-            console.log('Socket.IO connected');
+    
+    // Handle socket events
+    socket.on('connect', function() {
+        console.log('Socket.IO connected');
             
             // If we have a current task, make sure we're subscribed to its events
             if (currentTaskId) {
@@ -140,38 +282,42 @@
         socket.on('connect_error', function(error) {
             console.error('Socket.IO connection error:', error);
             addLogMessage('Error: Connection to server lost. Please refresh the page.');
-        });
-        
-        socket.on('task_log', function(data) {
+    });
+    
+    socket.on('task_log', function(data) {
             console.log('Received task log:', data);
-            if (data.task_id === currentTaskId) {
-                addLogMessage(data.message);
-                updateTaskProgress();
-            }
-        });
-        
-        socket.on('task_complete', function(data) {
+        if (data.task_id === currentTaskId) {
+            addLogMessage(data.message);
+            updateTaskProgress();
+        }
+    });
+    
+    socket.on('task_complete', function(data) {
             console.log('Task complete:', data);
-            if (data.task_id === currentTaskId) {
+        if (data.task_id === currentTaskId) {
                 // Check if this is a regular completion or an ended task with partial results
                 const status = data.status === 'ended' ? 'ended' : 'success';
                 completeTask(status, data.result, data.filename);
-            }
-        });
-        
-        socket.on('task_error', function(data) {
+        }
+    });
+    
+    socket.on('task_error', function(data) {
             console.log('Task error:', data);
-            if (data.task_id === currentTaskId) {
-                completeTask('error', data.error);
-            }
-        });
-        
-        socket.on('task_cancelled', function(data) {
-            console.log('Task cancelled:', data);
-            if (data.task_id === currentTaskId) {
-                completeTask('cancelled');
-            }
-        });
+        if (data.task_id === currentTaskId) {
+            completeTask('error', data.error);
+        }
+    });
+    
+    socket.on('task_cancelled', function(data) {
+            console.log('Task cancelled event received:', data);
+        if (data.task_id === currentTaskId) {
+            addLogMessage(data.message || 'Task was cancelled.', false);
+            resetTaskUI();
+            document.getElementById('taskStatus').style.display = 'none';
+            document.getElementById('logCard').style.display = 'none';
+            document.getElementById('resultCard').style.display = 'none';
+        }
+    });
 
         socket.on('task_ending', function(data) {
             console.log('Task ending:', data);
@@ -191,6 +337,9 @@
             
             // Reinitialize the socket connection
             initializeSocket();
+            
+            // Reload models after restart
+            loadAvailableModels();
         });
         
         socket.on('app_restart_error', function(data) {
@@ -235,11 +384,6 @@
 
     // Initialize socket when page loads
     initializeSocket();
-    
-    // Check for any running tasks when the page loads
-    window.addEventListener('load', function() {
-        checkForRunningTasks();
-    });
     
     // Function to check for any running tasks
     function checkForRunningTasks() {
@@ -306,24 +450,130 @@
     document.getElementById('taskForm').addEventListener('submit', function(e) {
         e.preventDefault();
         
-        if (taskRunning) {
-            alert('A task is already running. Please wait or cancel it first.');
+        const promptInput = document.getElementById('promptInput').value.trim();
+        const formatPrompt = document.getElementById('formatPrompt').value.trim();
+        const modelSelect = document.getElementById('modelSelect').value;
+        const maxSteps = document.getElementById('maxSteps').value;
+        const runHeadless = document.getElementById('runHeadlessCheckbox').checked;
+        
+        // Get selected output format
+        const outputFormatSelect = document.getElementById('outputFormatSelect');
+        const outputFormat = outputFormatSelect ? outputFormatSelect.value : 'docx'; // Default to docx
+        
+        if (!promptInput) {
+            alert('Please enter a search prompt');
             return;
         }
         
-        const prompt = document.getElementById('promptInput').value.trim();
-        if (!prompt) {
-            alert('Please enter a task instruction');
-            return;
-        }
+        // --- Prepare UI for New Task --- 
+        document.getElementById('taskStatus').style.display = 'block'; // Show status section
+        document.getElementById('logCard').style.display = 'block';    // Show log section
+        document.getElementById('resultCard').style.display = 'none';  // Hide previous result
         
-        startTask(prompt);
+        // Disable form
+        document.getElementById('promptInput').disabled = true;
+        document.getElementById('formatPrompt').disabled = true;
+        document.getElementById('modelSelect').disabled = true;
+        document.getElementById('maxSteps').disabled = true;
+        document.getElementById('runHeadlessCheckbox').disabled = true;
+        document.getElementById('runButton').disabled = true; // Disable Run button
+        document.getElementById('cancelButton').disabled = false; // ENABLE Cancel button
+        document.getElementById('endButton').disabled = false;    // ENABLE End button
+        
+        // Clear previous logs
+        document.getElementById('logOutput').textContent = '';
+        
+        // Reset progress bar and status text
+        document.getElementById('taskProgress').style.width = '0%';
+        document.getElementById('taskProgress').className = 'progress-bar progress-bar-striped progress-bar-animated bg-info'; // Reset style
+        document.getElementById('taskStatusText').textContent = 'Starting...';
+        document.getElementById('taskStatusText').className = 'badge bg-info';
+        
+        // Show global task indicator
+        document.getElementById('taskIndicator').style.display = 'block';
+        
+        // Determine Agent Type from toggle
+        const agentToggleInput = document.getElementById('agent-type-toggle');
+        const agentType = agentToggleInput && agentToggleInput.checked ? 'tavily' : 'browser';
+        
+        const payload = {
+            prompt: promptInput,
+            formatPrompt: formatPrompt,
+            model: modelSelect,
+            maxSteps: maxSteps,
+            agentType: agentType,
+            outputFormat: outputFormat,
+            runHeadless: runHeadless
+        };
+        console.log("[DEBUG index.html] Sending payload:", payload); // Log payload just before fetch
+        
+        // Send task to backend
+        fetch('/run_task', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(payload)
+        })
+        .then(response => response.json())
+        .then(data => {
+            if (data.status === 'success') {
+                // Store the task ID
+                currentTaskId = data.task_id;
+                
+                // Store start time
+                taskStartTime = new Date();
+                
+                // Mark task as running
+                taskRunning = true;
+                
+                // Update task info
+                document.getElementById('taskId').textContent = currentTaskId;
+                document.getElementById('taskStarted').textContent = taskStartTime.toLocaleTimeString();
+                document.getElementById('taskStatusText').textContent = 'Running'; // Update status to Running
+                document.getElementById('taskStatusText').className = 'badge bg-primary'; // Update class
+                
+                // Add initial log message
+                addLogMessage(`Task started with ID: ${currentTaskId}`);
+                
+                // Start periodic updates for elapsed time
+                startTaskUpdates();
+            } else {
+                completeTask('error', data.message);
+            }
+        })
+        .catch(error => {
+            console.error('Error starting task:', error);
+            completeTask('error', 'Failed to start task: ' + error.message);
+        });
     });
     
     // Cancel button
     document.getElementById('cancelButton').addEventListener('click', function() {
         if (currentTaskId && taskRunning) {
-            cancelTask(currentTaskId);
+            fetch('/cancel_task', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    task_id: currentTaskId
+                })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.status === 'success') {
+                    addLogMessage('Cancel request sent to backend.');
+                    document.getElementById('taskStatusText').textContent = 'Cancelling';
+                    document.getElementById('taskStatusText').className = 'badge bg-warning';
+                } else {
+                    addLogMessage(`Error sending cancel request: ${data.message}`);
+                }
+            })
+            .catch(error => {
+                console.error('Error sending cancel request:', error);
+                addLogMessage('An error occurred while sending the cancel request');
+            });
         }
     });
     
@@ -493,25 +743,36 @@
     
     // Reset the task UI
     function resetTaskUI() {
-        // Reset task variables
         currentTaskId = null;
         taskStartTime = null;
         taskRunning = false;
         
-        // Stop task updates
+        // Stop task updates timer
         if (logUpdateInterval) {
             clearInterval(logUpdateInterval);
             logUpdateInterval = null;
         }
         
-        // Re-enable run button
+        // Re-enable form elements
         document.getElementById('runButton').disabled = false;
+        document.getElementById('promptInput').disabled = false;
+        document.getElementById('formatPrompt').disabled = false;
+        document.getElementById('modelSelect').disabled = false;
+        document.getElementById('maxSteps').disabled = false;
+        document.getElementById('runHeadlessCheckbox').disabled = false;
+        document.getElementById('outputFormatSelect').disabled = false; // Re-enable output format
         
-        // Update task status
-        document.getElementById('taskStatusText').textContent = 'Ready';
-        document.getElementById('taskStatusText').className = 'badge bg-success';
+        // Ensure Cancel/End buttons are disabled (as task is over)
+        document.getElementById('cancelButton').disabled = true; 
+        document.getElementById('endButton').disabled = true;
         
-        addLogMessage('Ready for new task');
+        // Hide the global task indicator in the sidebar
+        if (typeof updateTaskIndicator === 'function') { // Check if function exists (it's in main.js)
+            updateTaskIndicator(false);
+        } 
+        // Note: We don't hide the status/log/result sections here anymore
+        // Note: We don't clear logs/results here; they show the final state
+        // Note: We don't add 'Ready for new task' log here; completion messages handle that
     }
     
     // Complete a task
@@ -530,11 +791,19 @@
             logUpdateInterval = null;
         }
         
-        // Enable run button
+        // Enable run button and other form elements
         document.getElementById('runButton').disabled = false;
+        document.getElementById('promptInput').disabled = false;
+        document.getElementById('formatPrompt').disabled = false;
+        document.getElementById('modelSelect').disabled = false;
+        document.getElementById('maxSteps').disabled = false;
+        document.getElementById('runHeadlessCheckbox').disabled = false;
+        document.getElementById('outputFormatSelect').disabled = false;
+        document.getElementById('cancelButton').disabled = true; // Disable cancel/end buttons
+        document.getElementById('endButton').disabled = true;
         
         // Update task status based on completion type
-        if (status === 'success') {
+        if (status === 'success' || status === 'completed') { // Combine success/completed
             document.getElementById('taskStatusText').textContent = 'Completed';
             document.getElementById('taskStatusText').className = 'badge bg-success';
             document.getElementById('taskProgress').style.width = '100%';
@@ -556,25 +825,18 @@
             document.getElementById('taskStatusText').textContent = 'Error';
             document.getElementById('taskStatusText').className = 'badge bg-danger';
             document.getElementById('taskProgress').className = 'progress-bar bg-danger';
+            document.getElementById('taskProgress').style.width = '100%'; // Fill bar on error
             
             // Display error message
             document.getElementById('resultCard').style.display = 'block';
             document.getElementById('resultContent').innerHTML = `<div class="alert alert-danger">${result}</div>`;
             
             addLogMessage(`Task failed: ${result}`);
-        } else if (status === 'cancelled') {
-            document.getElementById('taskStatusText').textContent = 'Cancelled';
-            document.getElementById('taskStatusText').className = 'badge bg-secondary';
-            document.getElementById('taskProgress').className = 'progress-bar bg-secondary';
-            
-            addLogMessage('Task was cancelled');
-            
-            // Reset the current task ID to allow starting a new task
-            currentTaskId = null;
         } else if (status === 'ended') {
             document.getElementById('taskStatusText').textContent = 'Ended';
             document.getElementById('taskStatusText').className = 'badge bg-primary';
             document.getElementById('taskProgress').className = 'progress-bar bg-primary';
+            document.getElementById('taskProgress').style.width = '100%'; // Fill bar on ended
             
             // Display partial result
             document.getElementById('resultCard').style.display = 'block';
@@ -588,10 +850,10 @@
             }
             
             addLogMessage('Task was ended with partial results');
-            
-            // Reset the current task ID to allow starting a new task
-            currentTaskId = null;
         }
+        
+        // --- Common actions after any completion status --- 
+        resetTaskUI(); // Re-enable form, disable cancel/end, hide sidebar indicator
     }
     
     // Add a message to the log
@@ -644,7 +906,7 @@
         
         // Auto-scroll to bottom
         if (autoScroll) {
-            logOutput.scrollTop = logOutput.scrollHeight;
+        logOutput.scrollTop = logOutput.scrollHeight;
         }
     }
     

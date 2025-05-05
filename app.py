@@ -10,16 +10,23 @@ import uuid
 import requests
 from typing import Dict, List, Optional
 import traceback
+from dotenv import load_dotenv
+from langchain_openai import ChatOpenAI
+from browser_use import Agent, Browser, BrowserConfig
 
 # Import utility modules
 from utils.agent import BrowserAgent
-from utils.document import save_result_as_docx
+from utils.document import save_result_file
 from utils.env_manager import load_env_file, save_env_file
 
 # Initialize Flask app
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.urandom(24)
-socketio = SocketIO(app, cors_allowed_origins="*")
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+
+# --- Constants ---
+PROMPTS_FILE = 'prompts.json'
+# MAX_ACTIONS_DEFAULT = 5 # Removed
 
 # Dictionary to store running tasks
 running_tasks = {}
@@ -27,8 +34,62 @@ running_tasks = {}
 # Load environment variables from .env file at startup
 load_env_file()
 
-# Initialize the Browser Agent
+# Load environment variables from .env file
+load_dotenv()
+
+# Initialize the Browser Agent (using the imported class)
 browser_agent = BrowserAgent()
+
+# --- Prompt Management Helpers ---
+
+def load_prompts():
+    """Load prompts from the JSON file."""
+    if not os.path.exists(PROMPTS_FILE):
+        return []
+    try:
+        with open(PROMPTS_FILE, 'r') as f:
+            content = f.read()
+            if not content.strip(): # Check if content is just whitespace
+                return []
+            # Parse the content string directly
+            return json.loads(content)
+    except (json.JSONDecodeError, IOError) as e:
+        print(f"Error loading prompts: {e}")
+        return []
+
+def save_prompts(prompts):
+    """Save prompts to the JSON file."""
+    try:
+        with open(PROMPTS_FILE, 'w') as f:
+            json.dump(prompts, f, indent=4)
+    except IOError as e:
+        print(f"Error saving prompts: {e}")
+
+# --- End Prompt Management Helpers ---
+
+@socketio.on('connect')
+def handle_connect():
+    """Handle WebSocket connection."""
+    print('Client connected')
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    """Handle WebSocket disconnection."""
+    print('Client disconnected')
+
+@socketio.on_error()
+def handle_error(e):
+    """Handle WebSocket errors."""
+    print(f'WebSocket error: {str(e)}')
+    # Returning None or an empty response is usually expected
+    return None
+
+@socketio.on_error_default
+def default_error_handler(e):
+    """Default error handler for WebSocket events."""
+    print(f'WebSocket default error: {str(e)}')
+    # Returning None or an empty response is usually expected
+    return None
 
 def get_openai_models(api_key: str) -> List[Dict[str, str]]:
     """Fetch available models from OpenAI API."""
@@ -228,6 +289,11 @@ def index():
     """Homepage with the prompt input form"""
     return render_template('index.html')
 
+@app.route('/prompts')
+def prompts_page():
+    """Page to display and manage saved prompts."""
+    return render_template('prompts.html')
+
 @app.route('/settings')
 def settings():
     """API key management page"""
@@ -255,32 +321,48 @@ def settings():
                         settings['ollama_api_url'] = value
                     elif key == 'OLLAMA_MODEL':
                         settings['ollama_model'] = value
-    
+                    # Add CHROME_PATH and others if needed for display
+                    elif key == 'CHROME_PATH':
+                        settings['chrome_path'] = value
+                    elif key == 'TIMEOUT':
+                        settings['timeout'] = value
+                    elif key == 'DEBUG':
+                         settings['debug'] = value
+                    # Check for Tavily API Key
+                    elif key == 'TAVILY_API_KEY':
+                         settings['tavily_api_key'] = value
+
     # Set default values if not present
     if 'ollama_api_url' not in settings:
         settings['ollama_api_url'] = 'http://localhost:11434'
-    
-    # Fetch available models
+    if 'model_provider' not in settings:
+        settings['model_provider'] = 'openai' # Default provider
+
+    # Fetch available models based on current provider keys/URLs
     openai_models = get_openai_models(settings.get('openai_api_key', ''))
     anthropic_models = get_anthropic_models(settings.get('anthropic_api_key', ''))
     ollama_models = get_ollama_models(settings.get('ollama_api_url', ''))
-    
+
     # Debug logging
     print("OpenAI Models:", openai_models)
     print("Anthropic Models:", anthropic_models)
     print("Ollama Models:", ollama_models)
     print("Settings:", settings)
-    
-    return render_template('settings.html', 
-                         env_vars=env_vars, 
+
+    # Check if Tavily key is present and has a value
+    tavily_key_present = bool(settings.get('tavily_api_key', '').strip())
+
+    return render_template('settings.html',
+                         env_vars=env_vars,
                          settings=settings,
                          openai_models=openai_models,
                          anthropic_models=anthropic_models,
-                         ollama_models=ollama_models)
+                         ollama_models=ollama_models,
+                         tavily_key_present=tavily_key_present)
 
 @app.route('/save_settings', methods=['POST'])
 def save_settings():
-    """Save API keys to .env file"""
+    """Save API keys and other settings to .env file"""
     # Get current environment variables to preserve existing values
     current_env_vars = {}
     if os.path.exists('.env'):
@@ -289,36 +371,30 @@ def save_settings():
                 if '=' in line:
                     key, value = line.strip().split('=', 1)
                     current_env_vars[key] = value
-    
+
     # Start with current environment variables
     env_vars = current_env_vars.copy()
-    
-    # Handle model provider selection
-    model_provider = request.form.get('model_provider', 'openai')
-    env_vars['MODEL_PROVIDER'] = model_provider
-    
-    # Update API keys and models without clearing the other provider
-    if model_provider == 'openai':
-        env_vars['OPENAI_API_KEY'] = request.form.get('openai_api_key', '')
-        env_vars['OPENAI_MODEL'] = request.form.get('openai_model', 'gpt-3.5-turbo')
-    elif model_provider == 'anthropic':
-        env_vars['ANTHROPIC_API_KEY'] = request.form.get('anthropic_api_key', '')
-        env_vars['ANTHROPIC_MODEL'] = request.form.get('anthropic_model', 'claude-3-sonnet-20240229')
-    elif model_provider == 'ollama':
-        # Get and clean the Ollama API URL (remove trailing slashes)
-        ollama_api_url = request.form.get('ollama_api_url', 'http://localhost:11434').rstrip('/')
-        
-        # Ensure URL has a scheme
-        if not ollama_api_url.startswith(('http://', 'https://')):
-            ollama_api_url = f'http://{ollama_api_url}'
-            
-        env_vars['OLLAMA_API_URL'] = ollama_api_url
-        env_vars['OLLAMA_MODEL'] = request.form.get('ollama_model', 'llama3')
-    
-    # Handle other settings
-    env_vars['TIMEOUT'] = request.form.get('key_TIMEOUT', '300')
-    env_vars['CHROME_PATH'] = request.form.get('key_CHROME_PATH', '')
-    env_vars['DEBUG'] = request.form.get('key_DEBUG', 'False')
+
+    # Update specific values from the form
+    env_vars['MODEL_PROVIDER'] = request.form.get('model_provider', 'openai')
+    env_vars['OPENAI_API_KEY'] = request.form.get('openai_api_key', '')
+    env_vars['OPENAI_MODEL'] = request.form.get('openai_model', 'gpt-3.5-turbo')
+    env_vars['ANTHROPIC_API_KEY'] = request.form.get('anthropic_api_key', '')
+    env_vars['ANTHROPIC_MODEL'] = request.form.get('anthropic_model', 'claude-3-sonnet-20240229')
+
+    # Get and clean the Ollama API URL
+    ollama_api_url = request.form.get('ollama_api_url', 'http://localhost:11434').rstrip('/')
+    if ollama_api_url and not ollama_api_url.startswith(('http://', 'https://')):
+        ollama_api_url = f'http://{ollama_api_url}'
+    env_vars['OLLAMA_API_URL'] = ollama_api_url
+    env_vars['OLLAMA_MODEL'] = request.form.get('ollama_model', 'llama3')
+
+    # Handle other settings from the form (using `key_` prefix as before)
+    # Preserve existing .env structure if keys exist there
+    env_vars['TAVILY_API_KEY'] = request.form.get('tavily_api_key', env_vars.get('TAVILY_API_KEY', ''))
+    env_vars['TIMEOUT'] = request.form.get('key_TIMEOUT', env_vars.get('TIMEOUT', '300'))
+    env_vars['CHROME_PATH'] = request.form.get('key_CHROME_PATH', env_vars.get('CHROME_PATH', ''))
+    env_vars['DEBUG'] = request.form.get('key_DEBUG', env_vars.get('DEBUG', 'False'))
     
     # Debug print
     print("Saving settings:", env_vars)
@@ -326,10 +402,10 @@ def save_settings():
     # Save to .env file
     save_env_file(env_vars)
     
-    # Reload environment variables
-    load_env_file()
+    # Reload environment variables into the current process
+    load_dotenv(override=True)
     
-    # Reinitialize the agent with new API keys
+    # Reinitialize the agent with potentially new settings
     browser_agent.reinitialize()
     
     return redirect(url_for('settings'))
@@ -343,15 +419,19 @@ def results():
     
     result_files = []
     for file in os.listdir(results_dir):
-        if file.endswith('.docx'):
+        # Include both .docx and .xlsx files
+        if file.lower().endswith(('.docx', '.xlsx')):
             file_path = os.path.join(results_dir, file)
-            file_info = {
-                'filename': file,
-                'path': file_path,
-                'size': os.path.getsize(file_path),
-                'created': datetime.fromtimestamp(os.path.getctime(file_path))
-            }
-            result_files.append(file_info)
+            try:
+                file_info = {
+                    'filename': file,
+                    'path': file_path,
+                    'size': os.path.getsize(file_path),
+                    'created': datetime.fromtimestamp(os.path.getctime(file_path))
+                }
+                result_files.append(file_info)
+            except OSError as e:
+                print(f"Error accessing file {file_path}: {e}")
     
     # Sort by creation date (newest first)
     result_files.sort(key=lambda x: x['created'], reverse=True)
@@ -362,29 +442,98 @@ def results():
 def run_task():
     """Start a browser task based on the prompt"""
     data = request.get_json()
+    print(f"[DEBUG /run_task] Received data: {data}") # Log received data
     task_prompt = data.get('prompt', '')
     format_prompt = data.get('formatPrompt', '')
+    selected_model = data.get('model', '')
+    max_steps = data.get('maxSteps', 30)
+    agent_type = data.get('agentType', 'browser') # Default to browser agent
+    print(f"[DEBUG /run_task] Assigned agent_type: {agent_type}") # Log assigned agent_type
+    output_format = data.get('outputFormat', 'docx') # Default to docx
+    print(f"[DEBUG /run_task] Assigned output_format: {output_format}") # Log assigned output_format
+    run_headless = data.get('runHeadless', False) # Get new parameter, default False (visible window)
     
     if not task_prompt:
         return jsonify({'status': 'error', 'message': 'Prompt cannot be empty'})
     
+    # Validate max_steps
+    try:
+        max_steps = int(max_steps)
+        if max_steps < 5:
+            max_steps = 5
+        elif max_steps > 100:
+            max_steps = 100
+    except (ValueError, TypeError):
+        max_steps = 30  # Default if invalid
+
+    # Validate run_headless (ensure boolean)
+    if not isinstance(run_headless, bool):
+        run_headless = False # Default to False if not a boolean
+    print(f"[DEBUG /run_task] Validated run_headless: {run_headless}")
+
+    task_specific_model = None
+    # Handle model selection if provided
+    if selected_model:
+        env_vars = {}
+        current_provider = None
+        if os.path.exists('.env'):
+             with open('.env', 'r') as f:
+                for line in f:
+                    if '=' in line:
+                        key, value = line.strip().split('=', 1)
+                        env_vars[key] = value
+                        if key == 'MODEL_PROVIDER':
+                            current_provider = value
+
+        # Check if the selected model requires a temporary override
+        provider_model_key = f"{current_provider.upper()}_MODEL" if current_provider else None
+        if provider_model_key and env_vars.get(provider_model_key) != selected_model:
+            log_message = f"Temporarily using model: {selected_model} (instead of {env_vars.get(provider_model_key, 'default')})"
+            print(log_message)
+            task_specific_model = selected_model # Pass this to the agent runner
+
     # Generate a unique task ID
     task_id = str(uuid.uuid4())
     
     # Create a wrapper function that properly handles the async function
-    def run_async_task_in_thread():
+    def run_async_task_in_thread(current_task_id, prompt, fmt_prompt, steps, headless_mode, model_override, agent_type_to_use, format_to_use):
+        print(f"[DEBUG run_async_task_in_thread] Received agent_type_to_use: {agent_type_to_use}") # Log received agent_type in thread
+        print(f"[DEBUG run_async_task_in_thread] Received format_to_use: {format_to_use}") # Log received format in thread
+        print(f"[DEBUG run_async_task_in_thread] Received headless_mode: {headless_mode}") # Log headless mode
         async_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(async_loop)
         try:
-            async_loop.run_until_complete(start_task_with_socketio(task_id, task_prompt, format_prompt))
+            # Pass the task-specific model and agent_type
+            async_loop.run_until_complete(start_task_with_socketio(
+                current_task_id, # Use passed task_id
+                prompt,          # Use passed prompt
+                fmt_prompt,      # Use passed format_prompt
+                steps,           # Use passed max_steps
+                task_specific_model=model_override, # Use passed model
+                agent_type=agent_type_to_use, # Use passed agent_type
+                output_format=format_to_use, # Use passed output format
+                run_headless=headless_mode # Pass headless mode
+            ))
         except Exception as e:
-            print(f"Error running task in thread: {str(e)}")
+            print(f"Error running task {current_task_id} in thread: {str(e)}")
             traceback.print_exc()
         finally:
             async_loop.close()
-    
+            # Note: Resetting model is handled within start_task_with_socketio's finally block
+
     # Start task in a background thread
-    thread = threading.Thread(target=run_async_task_in_thread)
+    thread_args = (
+        task_id, 
+        task_prompt, 
+        format_prompt, 
+        max_steps, 
+        run_headless, # Pass validated value
+        task_specific_model, 
+        agent_type,
+        output_format
+    )
+    print(f"[DEBUG /run_task] Passing args to thread: {thread_args}") # Log args being passed
+    thread = threading.Thread(target=run_async_task_in_thread, args=thread_args)
     thread.daemon = True
     thread.start()
     
@@ -401,29 +550,28 @@ def cancel_task():
     task_id = data.get('task_id')
     
     if task_id in running_tasks:
+        print(f"Cancellation requested for task: {task_id}")
         # Mark the task for cancellation
         running_tasks[task_id]['stop'] = True
-        
-        # Wait a short time to ensure cancellation message is processed
+
+        # Give the task a moment to recognize the stop signal
         time.sleep(0.5)
-        
-        # Remove the task from running tasks to reset state
-        running_tasks.pop(task_id, None)
-        
+
         # Emit a cancelled event via Socket.IO
-        socketio.emit('task_cancelled', {
+        # Let the finally block in start_task_with_socketio handle the final cleanup and emit
+        socketio.emit('task_cancelling', {
             'task_id': task_id,
-            'message': 'Task cancelled successfully'
+            'message': 'Task cancellation initiated...'
         })
-        
+
         return jsonify({
-            'status': 'success', 
-            'message': 'Task cancelled successfully'
+            'status': 'success',
+            'message': 'Task cancellation initiated successfully'
         })
-    
+
     return jsonify({
-        'status': 'error', 
-        'message': 'Task not found'
+        'status': 'error',
+        'message': 'Task not found or already completed'
     })
 
 @app.route('/download_result/<filename>')
@@ -441,115 +589,155 @@ def download_result(filename):
         404: If the file is not found.
         403: If the file path is invalid.
     """
+    results_dir = os.path.join(os.getcwd(), 'results')
+    # Securely join the path and resolve it to prevent path traversal
     try:
-        results_dir = os.path.join(os.getcwd(), 'results')
-        file_path = os.path.join(results_dir, filename)
-        
-        # Check if file exists
-        if not os.path.exists(file_path):
-            return jsonify({'status': 'error', 'message': 'File not found'}), 404
-            
-        # Check if file is in the results directory
-        if not os.path.abspath(file_path).startswith(os.path.abspath(results_dir)):
-            return jsonify({'status': 'error', 'message': 'Invalid file path'}), 403
-            
+        safe_path = os.path.abspath(os.path.join(results_dir, filename))
+
+        # Ensure the resolved path is still within the results directory
+        if not safe_path.startswith(os.path.abspath(results_dir)):
+             print(f"Forbidden: Path traversal attempt denied for {filename}")
+             return jsonify({'status': 'error', 'message': 'Invalid file path'}), 403
+
+        # Check if file exists using the safe path
+        if not os.path.isfile(safe_path):
+             print(f"File not found: {safe_path}")
+             return jsonify({'status': 'error', 'message': 'File not found'}), 404
+
         # Send the file as an attachment
         return send_from_directory(
-            results_dir,
-            filename,
+            results_dir, # Use original directory for sending
+            filename,    # Use original filename for sending
             as_attachment=True,
             mimetype='application/vnd.openxmlformats-officedocument.wordprocessingml.document'
         )
-        
+
     except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)}), 500
+        print(f"Error downloading file '{filename}': {str(e)}")
+        traceback.print_exc()
+        return jsonify({'status': 'error', 'message': f'Error downloading file: {str(e)}'}), 500
 
 @app.route('/diagnostics')
 def diagnostics():
     """Diagnostic page to check system settings"""
-    # Check Chrome path
+    # Check Chrome path from environment
     chrome_path = os.environ.get("CHROME_PATH", "").strip('"\'')
     chrome_exists = False
     chrome_is_file = False
     directory_contents = []
+    error_message = None
     
     if chrome_path:
-        chrome_exists = os.path.exists(chrome_path)
-        chrome_is_file = os.path.isfile(chrome_path)
-        
-        # Get directory listing
         try:
+            chrome_exists = os.path.exists(chrome_path)
+            if chrome_exists:
+                chrome_is_file = os.path.isfile(chrome_path)
+                if not chrome_is_file:
+                    error_message = "CHROME_PATH exists but is not a file (it should point to the executable)."
+                else:
+                     # Check if executable (basic check on Windows)
+                     if os.name == 'nt' and not chrome_path.lower().endswith('.exe'):
+                         error_message = "Warning: CHROME_PATH on Windows does not end with .exe"
+            else:
+                 error_message = "CHROME_PATH does not exist."
+
+            # Get directory listing of the parent directory
             parent_dir = os.path.dirname(chrome_path)
-            if os.path.exists(parent_dir):
-                directory_contents = os.listdir(parent_dir)[:10]  # Limit to 10 files
+            if os.path.isdir(parent_dir):
+                directory_contents = os.listdir(parent_dir)[:20] # Limit listing
+            else:
+                 directory_contents = [f"Parent directory '{parent_dir}' not found."]
+
         except Exception as e:
-            directory_contents = [f"Error: {str(e)}"]
-    
-    # Get all environment variables
-    env_vars = {}
-    for key, value in os.environ.items():
-        # Only include relevant variables, not system ones
-        if key.startswith(('OPENAI_', 'CHROME_', 'DEBUG', 'TIMEOUT')):
-            env_vars[key] = value
-    
-    # Check if .env file exists and read it
+            error_message = f"Error checking CHROME_PATH: {str(e)}"
+            directory_contents = [f"Error listing directory: {str(e)}"]
+    else:
+        error_message = "CHROME_PATH environment variable is not set."
+
+    # Get relevant environment variables from os.environ
+    relevant_env_vars = {}
+    keys_to_check = ['MODEL_PROVIDER', 'OPENAI_API_KEY', 'OPENAI_MODEL',
+                     'ANTHROPIC_API_KEY', 'ANTHROPIC_MODEL',
+                     'OLLAMA_API_URL', 'OLLAMA_MODEL',
+                     'CHROME_PATH', 'TIMEOUT', 'DEBUG']
+    for key in keys_to_check:
+        relevant_env_vars[key] = os.environ.get(key, 'Not Set')
+        # Mask API keys
+        if 'API_KEY' in key and relevant_env_vars[key] != 'Not Set':
+            relevant_env_vars[key] = relevant_env_vars[key][:4] + '...' + relevant_env_vars[key][-4:]
+
+    # Check if .env file exists and read its content
     env_file_exists = os.path.exists('.env')
-    env_file_content = ""
+    env_file_content = "Not found or empty."
     if env_file_exists:
         try:
             with open('.env', 'r') as f:
                 env_file_content = f.read()
+            if not env_file_content.strip():
+                 env_file_content = ".env file exists but is empty."
         except Exception as e:
             env_file_content = f"Error reading .env file: {str(e)}"
     
     # Return diagnostic information
     return jsonify({
-        'chrome_path': chrome_path,
-        'chrome_exists': chrome_exists,
-        'chrome_is_file': chrome_is_file,
-        'directory_contents': directory_contents,
-        'env_vars': env_vars,
-        'env_file_exists': env_file_exists,
-        'env_file_content': env_file_content
+        'chrome_path': {
+             'value': chrome_path,
+             'exists': chrome_exists,
+             'is_file': chrome_is_file,
+             'error': error_message,
+             'parent_dir_contents': directory_contents
+        },
+        'environment_variables': relevant_env_vars,
+        'dotenv_file': {
+             'exists': env_file_exists,
+             'content_preview': env_file_content[:500] + ('...' if len(env_file_content) > 500 else '') # Preview content
+        }
     })
 
 @app.route('/delete_result/<filename>', methods=['POST'])
 def delete_result(filename):
     """Delete a result file"""
     results_dir = os.path.join(os.getcwd(), 'results')
-    file_path = os.path.join(results_dir, filename)
-    
-    # Check if file exists
-    if not os.path.exists(file_path):
-        return jsonify({'status': 'error', 'message': 'File not found'})
-    
-    # Check if file is in the results directory
-    if not os.path.abspath(file_path).startswith(os.path.abspath(results_dir)):
-        return jsonify({'status': 'error', 'message': 'Invalid file path'})
-    
     try:
-        # Delete file
-        os.remove(file_path)
-        return jsonify({'status': 'success', 'message': 'File deleted successfully'})
+        # Securely join path and resolve
+        safe_path = os.path.abspath(os.path.join(results_dir, filename))
+
+        # Verify path is within the results directory
+        if not safe_path.startswith(os.path.abspath(results_dir)):
+            print(f"Forbidden: Path traversal attempt denied for deletion of {filename}")
+            return jsonify({'status': 'error', 'message': 'Invalid file path'}), 403
+
+        # Check if file exists and is a file before attempting deletion
+        if os.path.isfile(safe_path):
+            os.remove(safe_path)
+            print(f"Deleted result file: {safe_path}")
+            return jsonify({'status': 'success', 'message': 'File deleted successfully'})
+        else:
+             print(f"File not found for deletion: {safe_path}")
+             return jsonify({'status': 'error', 'message': 'File not found'}), 404
+
     except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)})
+        print(f"Error deleting file '{filename}': {str(e)}")
+        traceback.print_exc()
+        return jsonify({'status': 'error', 'message': f'Error deleting file: {str(e)}'}), 500
 
 @app.route('/restart_app', methods=['POST'])
 def restart_app():
     """Restart the Flask application and browser agent"""
     try:
+        print("Restart requested...")
         # Start a background thread to handle the actual restart
-        # This prevents blocking the HTTP response
         restart_thread = threading.Thread(target=perform_restart)
         restart_thread.daemon = True
         restart_thread.start()
-        
-        # Return success immediately
+
         return jsonify({
             'status': 'success',
             'message': 'Application restart initiated'
         })
     except Exception as e:
+        print(f"Error initiating restart: {str(e)}")
+        traceback.print_exc()
         return jsonify({
             'status': 'error',
             'message': f'Error initiating restart: {str(e)}'
@@ -557,46 +745,51 @@ def restart_app():
 
 def perform_restart():
     """Perform the actual restart operations in a background thread"""
+    print("Performing restart in background thread...")
     try:
-        # Mark all running tasks for cancellation
+        # Signal all running tasks to stop
         task_ids = list(running_tasks.keys())
+        print(f"Signalling stop for tasks: {task_ids}")
         for task_id in task_ids:
             if task_id in running_tasks:
                 running_tasks[task_id]['stop'] = True
-                
-                # Emit cancellation event via Socket.IO
-                socketio.emit('task_cancelled', {
+                # Emit cancellation event via Socket.IO (might be handled in finally block too)
+                socketio.emit('task_cancelling', {
                     'task_id': task_id,
                     'message': 'Task cancelled due to application restart'
                 })
-        
-        # Wait a moment for tasks to be cancelled properly
-        # This is now safe since we're in a background thread
-        time.sleep(1)
-        
-        # Clear any remaining running tasks
+
+        # Wait briefly for tasks to acknowledge stop signal
+        time.sleep(1.5) # Slightly longer wait
+
+        # Force clear any remaining tasks (should be stopped, but just in case)
         running_tasks.clear()
-        
+        print("Running tasks cleared.")
+
         # Clean up browser resources before reinitializing
+        print("Cleaning up browser resources...")
         try:
-            # Close any active browser instances
-            browser_agent.cleanup_resources()
+            # Call cleanup method on the agent instance
+             browser_agent.cleanup_resources()
+             print("Browser resources cleaned up.")
         except Exception as e:
             print(f"Warning: Error cleaning up browser resources: {str(e)}")
-        
-        # Reinitialize the browser agent
+
+        # Reinitialize the browser agent (loads new settings)
+        print("Reinitializing browser agent...")
         browser_agent.reinitialize()
-        
+        print("Browser agent reinitialized.")
+
         # Emit a restart complete event
         socketio.emit('app_restarted', {
             'status': 'success',
             'message': 'Application restarted successfully'
         })
-        
-        print("Application restart completed successfully")
-        
+        print("Application restart completed successfully.")
+
     except Exception as e:
-        print(f"Error during application restart: {str(e)}")
+        print(f"Error during application restart process: {str(e)}")
+        traceback.print_exc()
         # Emit error event
         socketio.emit('app_restart_error', {
             'status': 'error',
@@ -607,30 +800,34 @@ def perform_restart():
 def get_task_status():
     """Get the status of all running tasks or a specific task"""
     task_id = request.args.get('task_id')
-    
-    # If a specific task ID is provided, return that task's status
-    if task_id and task_id in running_tasks:
-        elapsed_time = time.time() - running_tasks[task_id]['start_time']
-        return jsonify({
-            'status': 'running',
-            'task_id': task_id,
-            'prompt': running_tasks[task_id]['prompt'],
-            'format_prompt': running_tasks[task_id]['format_prompt'],
-            'elapsed_time': elapsed_time,
-            'logs': running_tasks[task_id]['logs'],
-            'started_at': running_tasks[task_id]['start_time']
-        })
-    
-    # If no task ID or task not found, return all active tasks
+
+    # If a specific task ID is provided, return that task's detailed status
+    if task_id:
+        if task_id in running_tasks:
+            task_info = running_tasks[task_id]
+            elapsed_time = time.time() - task_info['start_time']
+            return jsonify({
+                'status': 'running',
+                'task_id': task_id,
+                'prompt': task_info.get('prompt', 'N/A'),
+                'format_prompt': task_info.get('format_prompt', ''),
+                'elapsed_time': round(elapsed_time, 2),
+                'logs': task_info.get('logs', []),
+                'started_at': task_info.get('start_time', 0)
+            })
+        else:
+             return jsonify({'status': 'not_found', 'task_id': task_id}), 404
+
+    # If no task ID, return summary of all active tasks
     active_tasks = {}
     for tid, task_info in running_tasks.items():
         active_tasks[tid] = {
-            'prompt': task_info['prompt'],
+            'prompt': task_info.get('prompt', 'N/A'),
             'format_prompt': task_info.get('format_prompt', ''),
-            'elapsed_time': time.time() - task_info['start_time'],
-            'started_at': task_info['start_time']
+            'elapsed_time': round(time.time() - task_info.get('start_time', 0), 2),
+            'started_at': task_info.get('start_time', 0)
         }
-    
+
     return jsonify({
         'has_active_tasks': len(active_tasks) > 0,
         'active_tasks': active_tasks
@@ -641,282 +838,543 @@ def end_task():
     """End a running browser task but preserve partial results"""
     data = request.get_json()
     task_id = data.get('task_id')
-    
+
     if task_id in running_tasks:
+        print(f"Graceful end requested for task: {task_id}")
         # Mark the task for graceful termination
         running_tasks[task_id]['end'] = True
-        
-        # Wait a short time to ensure the end message is processed
+
+        # Give the task a moment to recognize the end signal
         time.sleep(0.5)
-        
+
         # Emit an event to notify the client
         socketio.emit('task_ending', {
             'task_id': task_id,
-            'message': 'Task ending - preserving current progress'
+            'message': 'Task ending requested - preserving current progress...'
         })
-        
+
         return jsonify({
-            'status': 'success', 
+            'status': 'success',
             'message': 'Task ending requested'
         })
-    
+
     return jsonify({
-        'status': 'error', 
-        'message': 'Task not found'
+        'status': 'error',
+        'message': 'Task not found or already completed'
     })
 
 @app.route('/refresh_ollama_models', methods=['POST'])
 def refresh_ollama_models():
     """Refresh the list of available Ollama models."""
     data = request.get_json()
-    
-    # Get API URL from request or use default
+
+    # Get API URL from request or use default from environment
     api_url = data.get('api_url') if data and 'api_url' in data else None
     if not api_url:
         api_url = os.environ.get('OLLAMA_API_URL', 'http://localhost:11434')
-    
-    # Get models using the provided URL
-    models = get_ollama_models(api_url)
-    
-    return jsonify({
-        'status': 'success',
-        'models': models,
-        'count': len(models)
-    })
 
-async def start_task_with_socketio(task_id, task_prompt, format_prompt=''):
-    """Run the browser task and emit socket events for progress updates."""
+    try:
+        # Get models using the provided URL
+        models = get_ollama_models(api_url)
+        print(f"Refreshed Ollama models from {api_url}: Found {len(models)}")
+        return jsonify({
+            'status': 'success',
+            'models': models,
+            'count': len(models)
+        })
+    except Exception as e:
+        print(f"Error refreshing Ollama models from {api_url}: {str(e)}")
+        return jsonify({
+             'status': 'error',
+             'message': f'Failed to refresh models: {str(e)}',
+             'models': [],
+             'count': 0
+        }), 500
+
+@app.route('/available_models')
+def available_models():
+    """Get available models for the UI selection dropdown based on current settings"""
+    try:
+        # Determine the current provider from environment
+        model_provider = os.environ.get('MODEL_PROVIDER', 'openai')
+        current_model_id = None
+        current_model_name = None
+        models = []
+
+        print(f"Fetching available models for provider: {model_provider}")
+
+        if model_provider == 'openai':
+            current_model_id = os.environ.get('OPENAI_MODEL', 'gpt-4o')
+            api_key = os.environ.get('OPENAI_API_KEY', '')
+            if api_key:
+                models = get_openai_models(api_key)
+                print(f"Fetched {len(models)} OpenAI models")
+            if not models:
+                models = [
+                    {"id": "gpt-4o", "name": "GPT-4o"},
+                    {"id": "gpt-4-turbo", "name": "GPT-4 Turbo"},
+                    {"id": "gpt-4", "name": "GPT-4"},
+                    {"id": "gpt-3.5-turbo", "name": "GPT-3.5 Turbo"}
+                ]
+                print("Using default OpenAI models")
+
+        elif model_provider == 'anthropic':
+            current_model_id = os.environ.get('ANTHROPIC_MODEL', 'claude-3-sonnet-20240229')
+            api_key = os.environ.get('ANTHROPIC_API_KEY', '')
+            if api_key:
+                models = get_anthropic_models(api_key)
+                print(f"Fetched {len(models)} Anthropic models")
+            if not models:
+                models = [
+                    {"id": "claude-3-opus-20240229", "name": "Claude 3 Opus"},
+                    {"id": "claude-3-sonnet-20240229", "name": "Claude 3 Sonnet"},
+                    {"id": "claude-3-haiku-20240307", "name": "Claude 3 Haiku"},
+                    {"id": "claude-2.1", "name": "Claude 2.1"}
+                ]
+                print("Using default Anthropic models")
+
+        elif model_provider == 'ollama':
+            current_model_id = os.environ.get('OLLAMA_MODEL', 'llama3')
+            api_url = os.environ.get('OLLAMA_API_URL', '')
+            models = get_ollama_models(api_url) # Fetches or returns defaults
+            print(f"Fetched {len(models)} Ollama models (or defaults)")
+
+        else: # Default to OpenAI if provider is unknown
+             model_provider = 'openai'
+             current_model_id = os.environ.get('OPENAI_MODEL', 'gpt-4o')
+             models = [
+                    {"id": "gpt-4o", "name": "GPT-4o"},
+                    {"id": "gpt-4-turbo", "name": "GPT-4 Turbo"},
+                    {"id": "gpt-4", "name": "GPT-4"},
+                    {"id": "gpt-3.5-turbo", "name": "GPT-3.5 Turbo"}
+             ]
+             print("Unknown provider, using default OpenAI models")
+
+        # Format the current model name for display
+        if current_model_id:
+            current_model_name = current_model_id.replace('-', ' ').replace(':', ' ').title()
+            current_model = {"id": current_model_id, "name": current_model_name}
+        else:
+             current_model = None # Should not happen if defaults are set
+
+        # Ensure the current model is in the list, add if missing
+        if current_model:
+            current_model_in_list = any(m['id'] == current_model['id'] for m in models)
+            if not current_model_in_list:
+                models.insert(0, current_model)
+
+        return jsonify({
+            'current_model': current_model,
+            'available_models': models,
+            'provider': model_provider
+        })
+
+    except Exception as e:
+        print(f"Error in available_models route: {str(e)}")
+        traceback.print_exc()
+        # Return a safe default response
+        return jsonify({
+            'current_model': {"id": "error-model", "name": "Error"},
+            'available_models': [{"id": "error-model", "name": "Error Fetching Models"}],
+            'provider': "unknown",
+            'error': str(e)
+        }), 500
+
+async def start_task_with_socketio(task_id, task_prompt, format_prompt, max_steps, task_specific_model, agent_type, output_format, run_headless):
+    print(f"[DEBUG start_task_with_socketio] Received agent_type: {agent_type}") # Log received agent_type
+    print(f"[DEBUG start_task_with_socketio] Received output_format: {output_format}") # Log received output format
+    print(f"[DEBUG start_task_with_socketio] Received run_headless: {run_headless}") # Log headless mode
+    """Run the agent task and emit socket events for progress updates."""
     global running_tasks
-    
-    def log_callback(message):
+
+    def log_callback(message, level='info'):
         # Log to console for debugging
-        print(f"[{task_id}] {message}")
-        
-        # Update the task log
-        if task_id in running_tasks:
-            running_tasks[task_id]['logs'].append(message)
-            
-            # Track recent actions for pattern detection (keep last 10)
-            running_tasks[task_id]['last_actions'].append(message)
-            if len(running_tasks[task_id]['last_actions']) > 10:
-                running_tasks[task_id]['last_actions'].pop(0)
-            
-            # Detect step numbers in the log message
+        print(f"[{task_id} - {level.upper()}] {message}")
+
+        # Ensure task still exists before logging/emitting
+        if task_id not in running_tasks:
+            print(f"[{task_id}] Task ended or cancelled, skipping log: {message}")
+            return None # Task gone, do nothing
+
+        # Always store log
+        running_tasks[task_id]['logs'].append(f"[{level.upper()}] {message}")
+
+        # ----- Stuck Detection Logic -----
+        is_stuck = False
+        reason = ""
+        stuck_check_enabled = True # Can be disabled for debugging
+
+        if stuck_check_enabled:
             import re
             step_match = re.search(r'Step (\d+):', message)
             action_match = re.search(r'(clicking|typing|navigating|searching|reading|looking)', message.lower())
-            
-            # Check for repetitive actions that might indicate being stuck
-            is_stuck = False
-            reason = ""
-            
+
+            # Track recent actions (keep last N)
+            action_history_limit = 10
+            running_tasks[task_id]['last_actions'].append(message)
+            if len(running_tasks[task_id]['last_actions']) > action_history_limit:
+                running_tasks[task_id]['last_actions'].pop(0)
+
             if step_match:
                 step_number = step_match.group(1)
                 current_step = running_tasks[task_id]['current_step']
-                
-                # If this is a new step, reset the counter
+                max_repeats = 5 # Max times to repeat a step before intervention
+
                 if step_number != current_step:
+                    # New step detected
                     running_tasks[task_id]['current_step'] = step_number
                     running_tasks[task_id]['step_tracker'][step_number] = 1
                     running_tasks[task_id]['last_step_change_time'] = time.time()
+                    running_tasks[task_id]['error_count_this_step'] = 0 # Reset error count for new step
                 else:
-                    # Increment counter for the repeated step
-                    if step_number in running_tasks[task_id]['step_tracker']:
-                        running_tasks[task_id]['step_tracker'][step_number] += 1
-                    else:
-                        running_tasks[task_id]['step_tracker'][step_number] = 1
-                    
-                    # Check if step has been repeated more than 5 times
-                    if running_tasks[task_id]['step_tracker'][step_number] >= 5:
+                    # Same step repeated
+                    running_tasks[task_id]['step_tracker'][step_number] = running_tasks[task_id]['step_tracker'].get(step_number, 0) + 1
+                    if running_tasks[task_id]['step_tracker'][step_number] >= max_repeats:
                         is_stuck = True
-                        reason = f"repeated Step {step_number} more than 5 times"
-            
-            # Check for repeating the exact same action multiple times
+                        reason = f"repeated Step {step_number} {max_repeats} times"
+
+            # Check for repeating the exact same log message (strong indicator of loop)
             if len(running_tasks[task_id]['last_actions']) >= 3:
-                last_3_actions = running_tasks[task_id]['last_actions'][-3:]
-                if last_3_actions[0] == last_3_actions[1] == last_3_actions[2]:
+                last_3 = running_tasks[task_id]['last_actions'][-3:]
+                if last_3[0] == last_3[1] == last_3[2]:
                     is_stuck = True
-                    reason = "repeated the exact same action 3 times in a row"
-            
-            # Check for error messages that might indicate being stuck
+                    reason = "repeated the exact same action 3 times"
+
+            # Check for frequent error messages within the current step
             error_keywords = ["failed", "error", "cannot", "unable to", "not found", "doesn't exist", "timeout"]
             if any(keyword in message.lower() for keyword in error_keywords) and action_match:
-                # If we see an error with an action, increment the counter for potential stuck state
-                running_tasks[task_id]['unstuck_attempts'] += 0.5
-                if running_tasks[task_id]['unstuck_attempts'] >= 3:
-                    is_stuck = True
-                    reason = "encountered multiple errors while trying to perform actions"
-            
-            # If we determine the agent is stuck, send an intervention
-            if is_stuck:
-                # Check if it's been at least 30 seconds since the last move-on prompt
-                time_since_change = time.time() - running_tasks[task_id]['last_step_change_time']
-                if time_since_change > 30:
-                    # Get the current step number
-                    step_number = running_tasks[task_id]['current_step'] or "unknown"
-                    
-                    # Send a prompt to move on
-                    move_on_message = f"Agent appears to be stuck on Step {step_number} ({reason}). Prompting it to move on..."
-                    print(f"Task {task_id}: {move_on_message}")
-                    running_tasks[task_id]['logs'].append(move_on_message)
-                    
-                    # Reset the step change time to avoid spamming move-on prompts
-                    running_tasks[task_id]['last_step_change_time'] = time.time()
-                    running_tasks[task_id]['unstuck_attempts'] += 1
-                    
-                    # Reset step counter for this step
-                    if step_number in running_tasks[task_id]['step_tracker']:
-                        running_tasks[task_id]['step_tracker'][step_number] = 0
-                    
-                    # Modify the task prompt to include instructions to move on
-                    original_prompt = running_tasks[task_id]['prompt']
-                    if not running_tasks[task_id]['modified_prompt']:
-                        # First time getting stuck, append instructions
-                        unstuck_instruction = f"\n\nIMPORTANT: If you find yourself stuck or repeating the same step multiple times, please try a different approach or move on to the next step. Don't get trapped in loops."
-                        running_tasks[task_id]['modified_prompt'] = original_prompt + unstuck_instruction
-                    
-                    # Create a direct intervention message for the current step
-                    # Make the message more urgent based on how many times we've been stuck
-                    urgency = "NOW" if running_tasks[task_id]['unstuck_attempts'] <= 1 else "IMMEDIATELY"
-                    
-                    intervention_message = f"""
-SYSTEM MESSAGE: You appear to be stuck on Step {step_number} because you have {reason}. Please try one of the following:
-1. Move on to Step {int(step_number) + 1 if step_number.isdigit() else "the next step"}
-2. Try a completely different approach to complete this step
-3. If the issue is with a UI element, try finding an alternative way to accomplish the task
-4. Skip this part of the task if it's not essential
+                 running_tasks[task_id]['error_count_this_step'] += 1
+                 max_errors_per_step = 3
+                 if running_tasks[task_id]['error_count_this_step'] >= max_errors_per_step:
+                     is_stuck = True
+                     reason = f"encountered {max_errors_per_step} errors on the current step"
 
-DO NOT continue repeating the same actions. Change your approach {urgency}.
+
+            # ----- Intervention Logic -----
+            if is_stuck:
+                min_time_between_interventions = 30 # seconds
+                time_since_last_intervention = time.time() - running_tasks[task_id]['last_intervention_time']
+
+                if time_since_last_intervention > min_time_between_interventions:
+                    step_num = running_tasks[task_id]['current_step'] or "current"
+                    running_tasks[task_id]['interventions_attempted'] += 1
+                    urgency = "NOW" if running_tasks[task_id]['interventions_attempted'] <= 1 else "IMMEDIATELY"
+
+                    intervention_log = f"Agent appears stuck on Step {step_num} ({reason}). Attempting intervention #{running_tasks[task_id]['interventions_attempted']}..."
+                    print(f"Task {task_id}: {intervention_log}")
+                    running_tasks[task_id]['logs'].append(intervention_log)
+
+                    intervention_message = f"""
+SYSTEM MESSAGE (Intervention #{running_tasks[task_id]['interventions_attempted']}):
+You seem stuck on Step {step_num} because you have {reason}.
+Please try one of these options {urgency}:
+1. Move on to the next logical step (e.g., Step {int(step_num) + 1 if step_num.isdigit() else 'next'}).
+2. Attempt the current step using a completely different method or action.
+3. If interacting with a specific element fails, try an alternative element or navigation method.
+4. Briefly summarize why you are stuck and what you will try next.
+5. If absolutely necessary, skip this specific sub-task and proceed with the main objective.
+
+DO NOT repeat the failing action. Change your approach.
 """
-                    
-                    # Emit the move-on prompt via socket
-                    socketio.emit('task_log', {
-                        'task_id': task_id,
-                        'message': move_on_message,
-                        'timestamp': time.time()
-                    })
-                    
-                    # Emit the intervention message as a separate log to show it prominently
-                    socketio.emit('task_log', {
-                        'task_id': task_id,
-                        'message': intervention_message,
-                        'timestamp': time.time()
-                    })
-                    
-                    # Return the intervention message to be sent to the agent
-                    return intervention_message
-            
-            # Emit the log via socket
-            socketio.emit('task_log', {
-                'task_id': task_id,
-                'message': message,
-                'timestamp': time.time()
-            })
-            
-            # Return None for normal logs, no special action needed
-            return None
-    
+                    # Emit logs via socket
+                    socketio.emit('task_log', {'task_id': task_id, 'message': intervention_log, 'timestamp': time.time(), 'level': 'warning'})
+                    socketio.emit('task_log', {'task_id': task_id, 'message': intervention_message, 'timestamp': time.time(), 'level': 'system'})
+
+                    # Update intervention time and potentially reset step counter
+                    running_tasks[task_id]['last_intervention_time'] = time.time()
+                    if step_num in running_tasks[task_id]['step_tracker']:
+                         running_tasks[task_id]['step_tracker'][step_num] = 0 # Reset counter after intervention
+                         running_tasks[task_id]['error_count_this_step'] = 0
+
+                    # Return the intervention message to be possibly used by the agent (implementation specific)
+                    # In browser-use, log_callback doesn't directly feed back, but logs are visible
+                    # If a different agent library were used, this could be returned to influence it.
+                    # For now, it's primarily for logging and observation.
+
+        # ----- Normal Log Emission -----
+        # Emit the original log message via socket
+        socketio.emit('task_log', {
+            'task_id': task_id,
+            'message': message, # Send original message
+            'timestamp': time.time(),
+            'level': level
+        })
+
+        # Return None for normal logs, indicating no special agent action needed from callback
+        return None
+
+    # --- Main Task Execution ---
+    result = None
     try:
-        # Create task entry
+        # Create task entry in the global dictionary
         running_tasks[task_id] = {
             'prompt': task_prompt,
             'format_prompt': format_prompt,
             'start_time': time.time(),
-            'stop': False,
+            'stop': False, # Flag for hard cancellation
             'end': False,  # Flag for graceful termination
             'logs': [],
-            'step_tracker': {},  # Track step repetitions
+            'step_tracker': {}, # Track step repetitions {step_num: count}
             'current_step': None,
             'last_step_change_time': time.time(),
-            'modified_prompt': None,  # Store a modified prompt if we need to add unstuck instructions
-            'unstuck_attempts': 0,    # Count how many times we've tried to get unstuck
-            'last_actions': [],       # Track recent actions to detect repetitive patterns
-            'partial_results': None   # Store partial results
+            'error_count_this_step': 0,
+            'last_intervention_time': 0, # Track intervention timing
+            'interventions_attempted': 0,
+            'last_actions': [], # Track recent actions
+            'partial_results': None, # Store partial results if needed
+            'task_specific_model': task_specific_model, # Store model used
+            'agent_type': agent_type, # Store agent type
+            'final_status': 'running', # Add a field to track the intended final state
+            'output_format': output_format, # Store the requested output format
+            'run_headless': run_headless, # Store headless preference
         }
-        
-        # Custom log handler that emits socket events
+        print(f"Task {task_id} created. Prompt: '{task_prompt[:50]}...' Model: {task_specific_model or 'default'}")
+
+        # Use the custom log callback
         log_handler = log_callback
-        
-        try:
-            log_handler("Starting browser task...")
-            # Run the agent task - use the current event loop
-            result = await browser_agent.run_task(
-                running_tasks[task_id]['modified_prompt'] or running_tasks[task_id]['prompt'], 
+
+        log_handler("Starting agent task execution...") # Adjusted log message
+
+        print(f"[DEBUG start_task_with_socketio] Calling browser_agent.run_task with agent_type: {agent_type}") # Log type just before call
+        # Configure and run the agent task using the imported BrowserAgent instance
+        result = await browser_agent.run_task(
+            task_description=task_prompt,
                 log_callback=log_handler, 
-                stop_check=lambda: task_id not in running_tasks or running_tasks[task_id]['stop'],
-                end_check=lambda: task_id in running_tasks and running_tasks[task_id]['end'],
-                format_prompt=running_tasks[task_id]['format_prompt']
-            )
-            
-            # Save result as a Word document
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"result_{timestamp}.docx"
-            result_path = save_result_as_docx(
-                running_tasks[task_id]['prompt'], 
-                result, 
-                running_tasks[task_id]['logs'], 
-                filename, 
-                running_tasks[task_id]['format_prompt']
-            )
-            
-            # Check if the task was gracefully ended
-            was_ended = task_id in running_tasks and running_tasks[task_id]['end']
-            
-            # Emit appropriate task completion event
-            if was_ended:
-                socketio.emit('task_complete', {
-                    'task_id': task_id,
-                    'success': True,
-                    'result': result,
-                    'filename': filename,
-                    'elapsed_time': time.time() - running_tasks[task_id]['start_time'],
-                    'status': 'ended'  # Mark this as an ended task with partial results
-                })
-            else:
-                socketio.emit('task_complete', {
-                    'task_id': task_id,
-                    'success': True,
-                    'result': result,
-                    'filename': filename,
-                    'elapsed_time': time.time() - running_tasks[task_id]['start_time']
-                })
-            
-        except Exception as e:
-            error_message = str(e)
-            log_handler(f"Error: {error_message}")
-            
-            # Emit task error event
-            socketio.emit('task_error', {
-                'task_id': task_id,
-                'error': error_message,
-                'elapsed_time': time.time() - running_tasks[task_id]['start_time']
-            })
-            
-        except Exception as e:
-            print(f"Error in start_task_with_socketio: {str(e)}")
-            traceback.print_exc()
-            socketio.emit('task_error', {
-                'task_id': task_id,
-                'error': str(e),
-                'elapsed_time': 0
-            })
-    
-    finally:
-        # If the task still exists in running_tasks, handle its state
+            stop_check=lambda: task_id not in running_tasks or running_tasks[task_id]['stop'],
+            end_check=lambda: task_id in running_tasks and running_tasks[task_id]['end'],
+            format_prompt=format_prompt,
+            max_steps=max_steps,
+            task_specific_model=task_specific_model, # Pass temporary model override
+            agent_type=agent_type, # Pass agent type
+            run_headless=run_headless # Pass headless mode
+        )
+
+        # --- Determine Outcome (if no exception occurred) ---
+        if task_id in running_tasks: # Check if task wasn't cancelled/removed during run
+            if running_tasks[task_id]['end']: # Graceful end requested
+                running_tasks[task_id]['final_status'] = 'ended'
+                log_handler(f"Task {task_id} ended gracefully by request.")
+            elif running_tasks[task_id]['stop']: # Stop was set but didn't raise CancelledError (unlikely but possible)
+                 running_tasks[task_id]['final_status'] = 'cancelled'
+                 log_handler(f"Task {task_id} stopped by request (post-run check).", level='warning')
+            else: # Normal completion
+                running_tasks[task_id]['final_status'] = 'completed'
+                log_handler(f"Task {task_id} completed normally.")
+
+    except asyncio.CancelledError:
+        # --- Task Cancellation Handling --- 
+        log_handler("Task run was cancelled (CancelledError caught).")
         if task_id in running_tasks:
-            # If the task was marked for cancellation, emit a cancellation event
-            if running_tasks[task_id].get('stop', False):
-                socketio.emit('task_cancelled', {
-                    'task_id': task_id,
-                    'elapsed_time': time.time() - running_tasks[task_id]['start_time']
-                })
-            # Remove the task from running tasks
-            running_tasks.pop(task_id, None)
+            # Check if cancellation was triggered by the 'end' flag
+            if running_tasks[task_id]['end']:
+                running_tasks[task_id]['final_status'] = 'ended'
+                log_handler(f"Task {task_id} ended by request (CancelledError handled).")
+                result = "Task Ended" # Set appropriate result placeholder
+            else:
+                running_tasks[task_id]['final_status'] = 'cancelled'
+                log_handler(f"Task {task_id} cancelled by request (CancelledError handled).")
+                result = "Task Cancelled" 
+        else:
+            # Task already removed, assume cancelled
+            log_handler(f"Task {task_id} cancelled (task already removed).", level='warning')
+            result = "Task Cancelled" 
+
+    except Exception as e:
+        # --- Task Execution Error Handling ---
+        error_message = f"Critical error during task {task_id} execution: {str(e)}"
+        print(error_message) # Ensure critical errors are printed
+        traceback.print_exc()
+        log_handler(error_message, level='critical') # Use critical level
+        if task_id in running_tasks:
+            running_tasks[task_id]['final_status'] = 'error'
+            running_tasks[task_id]['error_message'] = error_message # Store error message
+        result = f"Critical Error: {str(e)}" # Set result to error message
+
+    finally:
+        # --- Task Cleanup & Final Status Emission --- 
+        print(f"Executing finally block for task {task_id}")
+        final_status = 'unknown'
+        final_message = "Task finished with unknown status."
+        saved_filename = None
+
+        if task_id in running_tasks:
+            task_info = running_tasks[task_id]
+            elapsed_time = round(time.time() - task_info.get('start_time', time.time()), 2)
+            final_status = task_info.get('final_status', 'unknown')
+
+            # --- Save Results (Only if Completed or Ended) ---
+            if final_status in ['completed', 'ended']:
+                log_handler(f"Task {task_id} {final_status}. Saving results...")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base_filename = f"result_{task_id[:8]}_{timestamp}.docx"
+        results_dir = os.path.join(os.getcwd(), 'results')
+        os.makedirs(results_dir, exist_ok=True)
+
+        try:
+                    # Use the 'result' variable captured from the try block, or partial results if available
+            # Get the requested format for saving
+            requested_format = task_info.get('output_format', 'docx') 
+            result_content_to_save = result or task_info.get('partial_results', "No result captured.")
+            result_path = save_result_file(
+                result_content=result_content_to_save,
+                filename=base_filename,
+                output_format=requested_format, # Pass format to saving function
+                search_query=task_info.get('prompt', ''),
+                format_instructions=task_info.get('format_prompt', ''),
+                execution_logs=task_info.get('logs', [])
+            )
+        except Exception as save_err:
+            error_message = f"Error saving document for task {task_id}: {str(save_err)}"
+            log_handler(error_message, level='error')
+            traceback.print_exc()
+            final_status = 'error' # Downgrade status if saving failed
+            final_message = error_message
+            # Ensure error message is stored if saving fails and task still exists
+            if task_id in running_tasks: 
+                running_tasks[task_id]['error_message'] = error_message 
+
+        if not result_path or not os.path.exists(result_path):
+            raise ValueError(f"Failed to save document or file not found at {result_path}")
+            
+            saved_filename = base_filename # Store filename for emit
+            log_handler(f"Result saved to {saved_filename}")
+            final_message = result or "Partial results saved." if final_status == 'ended' else "Task completed successfully."
+
+
+        # --- Set Final Messages for Other Statuses ---
+        elif final_status == 'cancelled':
+            final_message = f"Task {task_id} was cancelled after {elapsed_time}s."
+        elif final_status == 'error':
+                final_message = task_info.get('error_message', f"Task {task_id} failed after {elapsed_time}s.")
+        else: # Handle unknown or unexpected status
+                final_message = f"Task {task_id} finished with status '{final_status}' after {elapsed_time}s."
+        
+        print(final_message) # Log final message to console
+
+            # --- Model Reset (before removing task info) --- 
+        if task_info.get('task_specific_model'):
+                try:
+                    browser_agent.reset_model()
+                    print(f"Reset agent model after task {task_id}.")
+                except Exception as reset_err:
+                     print(f"Warning: Error resetting agent model for task {task_id}: {reset_err}")
+
+            # --- Remove Task BEFORE Emitting Final Event --- 
+            # This prevents race conditions with background status checks
+        print(f"Removing task {task_id} from running tasks before final emit.")
+        running_tasks.pop(task_id, None)
+
+            # --- Emit Final Socket Event --- 
+        if final_status in ['completed', 'ended']:
+            print(f"Emitting task_complete for {task_id}")
+            socketio.emit('task_complete', {
+            'task_id': task_id,
+            'success': True,
+            'result': final_message, 
+            'filename': saved_filename,
+            'elapsed_time': elapsed_time,
+            'status': final_status # Send 'completed' or 'ended'
+        })
+        elif final_status == 'cancelled':
+            print(f"Emitting task_cancelled for {task_id}")
+            socketio.emit('task_cancelled', {
+                'task_id': task_id,
+                'message': final_message,
+                'elapsed_time': elapsed_time
+            })
+        elif final_status == 'error':
+            print(f"Emitting task_error for {task_id}")
+            socketio.emit('task_error', {
+                'task_id': task_id,
+                'error': final_message,
+                'elapsed_time': elapsed_time
+            })
+        else: # Fallback for unknown status
+            print(f"Emitting task_error (unknown status) for {task_id}")
+            socketio.emit('task_error', {
+                'task_id': task_id,
+                'error': f"Task finished with unknown status: {final_status}",
+                'elapsed_time': elapsed_time
+            })
+        
+
+            print(f"Final message for task {task_id}: {final_message}") # Log final message
+
+
+
+# --- API Endpoints for Prompts ---
+
+@app.route('/api/prompts', methods=['GET'])
+def get_prompts():
+    """API endpoint to get all saved prompts."""
+    prompts = load_prompts()
+    return jsonify(prompts)
+
+@app.route('/api/prompts', methods=['POST'])
+def add_prompt():
+    """API endpoint to add a new prompt."""
+    data = request.get_json()
+    if not data or 'text' not in data or not data['text'].strip():
+        return jsonify({'status': 'error', 'message': 'Prompt text cannot be empty'}), 400
+    
+    prompts = load_prompts()
+    new_prompt = {
+        'id': str(uuid.uuid4()),
+        'text': data['text'].strip()
+    }
+    prompts.append(new_prompt)
+    save_prompts(prompts)
+    return jsonify({'status': 'success', 'prompt': new_prompt}), 201
+
+@app.route('/api/prompts/search', methods=['GET'])
+def search_prompts():
+    """API endpoint to search saved prompts."""
+    query = request.args.get('query', '').lower()
+    prompts = load_prompts()
+    if not query:
+        return jsonify(prompts)
+    
+    filtered_prompts = [p for p in prompts if query in p.get('text', '').lower()]
+    return jsonify(filtered_prompts)
+
+@app.route('/api/prompts/<prompt_id>', methods=['DELETE'])
+def delete_prompt(prompt_id):
+    """API endpoint to delete a specific prompt."""
+    prompts = load_prompts()
+    initial_length = len(prompts)
+    prompts = [p for p in prompts if p.get('id') != prompt_id]
+    
+    if len(prompts) < initial_length:
+        save_prompts(prompts)
+        return jsonify({'status': 'success', 'message': 'Prompt deleted'})
+    else:
+        return jsonify({'status': 'error', 'message': 'Prompt not found'}), 404
+
+# --- End API Endpoints for Prompts ---
 
 if __name__ == '__main__':
     # Ensure results directory exists
-    if not os.path.exists('results'):
-        os.makedirs('results')
+    results_path = 'results'
+    if not os.path.exists(results_path):
+        print(f"Creating results directory at: {os.path.abspath(results_path)}")
+        os.makedirs(results_path)
+
+    # Determine host based on DEBUG environment variable
+    debug_mode = os.environ.get('DEBUG', 'False').lower() == 'true'
+    host = '127.0.0.1' if debug_mode else '0.0.0.0'
+    port = 5000
+
+    print(f"Starting Flask app with Socket.IO...")
+    print(f" * Host: {host}:{port}")
+    print(f" * Debug Mode: {debug_mode}")
+    print(f" * Allow Unsafe Werkzeug: True") # Necessary for threading mode sometimes
+    print(f" * Use Reloader: False") # Important for SocketIO stability
     
-    # Run the Flask app with Socket.IO, making it accessible on the local network
-    socketio.run(app, host='0.0.0.0', port=5000, debug=True, allow_unsafe_werkzeug=True)
+    # Run the Flask app with Socket.IO
+    # use_reloader=False is important to prevent issues with threading/async modes
+    socketio.run(app,
+                host=host,
+                port=port,
+                debug=debug_mode,
+                allow_unsafe_werkzeug=True,
+                use_reloader=False) # MUST be False for stability
