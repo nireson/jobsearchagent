@@ -33,8 +33,8 @@ A powerful web-based AI research agent that automates browser tasks and generate
 
 1. Clone the repository:
 ```bash
-git clone <repository-url>
-cd jobsagent2
+git clone https://github.com/nireson/jobsearchagent
+cd jobsearchagent
 ```
 
 2. Create and activate a virtual environment:
