@@ -1,46 +1,55 @@
-# Getting Started with Browser Agent UI
+# Getting Started with Job Search Agent
 
-This guide will help you set up and start using the Browser Agent UI.
+This guide will help you set up and start using the Job Search Agent.
 
 ## Step 1: Set up your environment
 
-First, make sure you have Python 3.8+ installed. Then follow these steps:
+First, make sure you have Python 3.11.x installed (Python 3.12 is not yet supported). You can download Python 3.11 from the [official Python website](https://www.python.org/downloads/release/python-3116/).
+
+Verify your Python version:
+```bash
+python --version  # Should show Python 3.11.x
+```
+
+Then follow these steps:
 
 ```bash
-# Clone the repository (if using Git)
-git clone https://github.com/yourusername/browser-agent-ui.git
-cd browser-agent-ui
-
-# Or simply create a directory for the project files
+# Clone the repository
+git clone <repository-url>
+cd jobsagent2
 
 # Create a virtual environment
-python -m venv venv
+python -m venv .venv
 
 # Activate the virtual environment
 # On Windows:
-venv\Scripts\activate
+.venv\Scripts\activate
 # On macOS/Linux:
-source venv/bin/activate
+source .venv/bin/activate
 
 # Install dependencies
-pip install -r requirements.txt
+# First upgrade pip and setuptools
+python -m pip install --upgrade pip setuptools
 
-# Install browser driver for browser-use
-playwright install chromium
+# Then install project dependencies
+pip install -r requirements.txt
 ```
 
 ## Step 2: Configure API keys
 
-You need an OpenAI API key to use the browser agent:
+You'll need API keys for the following services:
 
-1. Get your API key from [OpenAI](https://platform.openai.com/api-keys)
-2. Create a `.env` file in the project root directory
-3. Add your API key:
-   ```
-   OPENAI_API_KEY=your_api_key_here
-   ```
+1. OpenAI API key (required) - Get from [OpenAI](https://platform.openai.com/api-keys)
+2. Anthropic API key (optional) - Get from [Anthropic](https://console.anthropic.com/)
+3. Other optional API keys as needed
 
-Alternatively, you can add your API key through the Settings page after starting the application.
+Create a `.env` file in the project root directory and add your API keys:
+```
+OPENAI_API_KEY=your_api_key_here
+ANTHROPIC_API_KEY=your_api_key_here  # Optional
+```
+
+You can also add your API keys through the Settings page after starting the application.
 
 ## Step 3: Run the application
 

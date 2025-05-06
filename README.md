@@ -9,27 +9,42 @@ A Flask web application that helps automate job searching and application proces
 - Save and manage search results
 - Configure multiple API providers and settings
 
+## Requirements
+
+- Python 3.11.x (Python 3.12 is not yet supported)
+- Windows, macOS, or Linux operating system
+- At least 2GB of free disk space
+- Internet connection for API access
+
 ## Installation
 
-1. Clone the repository:
+1. Ensure you have Python 3.11 installed:
+```bash
+python --version  # Should show Python 3.11.x
+```
+
+2. Clone the repository:
 ```bash
 git clone <repository-url>
 cd jobsagent2
 ```
 
-2. Create and activate a virtual environment:
+3. Create and activate a virtual environment:
 ```bash
 python -m venv .venv
 .venv\Scripts\activate  # On Windows
 source .venv/bin/activate  # On Unix/MacOS
 ```
 
-3. Install dependencies:
+4. Install dependencies:
 ```bash
+# Upgrade pip and setuptools first
+python -m pip install --upgrade pip setuptools
+# Install project dependencies
 pip install -r requirements.txt
 ```
 
-4. Configure environment variables:
+5. Configure environment variables:
 - Copy `.env_example` to `.env`
 - Set required API keys and configuration (see GETTING_STARTED.md)
 - Required API keys include OpenAI, Anthropic (optional), and other service providers
